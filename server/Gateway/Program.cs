@@ -25,6 +25,34 @@ app.UseWebSockets();
 var gameLoop = new GameLoop();
 _ = gameLoop.RunAsync(app.Lifetime.ApplicationStopping);
 
+// Lightweight server-side movement logging so we can observe ship motion.
+var logger = app.Logger;
+var tickCounter = 0;
+gameLoop.StateUpdated += snapshot =>
+{
+    // Log roughly once per second (gameLoop default tick is 30 Hz).
+    tickCounter++;
+    if (tickCounter % 30 != 0)
+    {
+        return;
+    }
+
+    if (snapshot.Count == 0)
+    {
+        logger.LogInformation("Simulation tick: no ships active.");
+        return;
+    }
+
+    foreach (var ship in snapshot)
+    {
+        logger.LogInformation(
+            "Ship {ShipId} pos=({PX:F2}, {PY:F2}, {PZ:F2}) vel=({VX:F2}, {VY:F2}, {VZ:F2})",
+            ship.Id,
+            ship.Position.X, ship.Position.Y, ship.Position.Z,
+            ship.Velocity.X, ship.Velocity.Y, ship.Velocity.Z);
+    }
+};
+
 app.MapGet("/", () => Results.Ok("Gateway is running"));
 
 app.Map("/ws", async context =>
