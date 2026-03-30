@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net.WebSockets;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -25,32 +26,25 @@ app.UseWebSockets();
 var gameLoop = new GameLoop();
 _ = gameLoop.RunAsync(app.Lifetime.ApplicationStopping);
 
-// Lightweight server-side movement logging so we can observe ship motion.
+// Tick-rate logging so we can verify real simulation frequency.
 var logger = app.Logger;
 var tickCounter = 0;
-gameLoop.StateUpdated += snapshot =>
+var tickStopwatch = Stopwatch.StartNew();
+gameLoop.StateUpdated += _ =>
 {
-    // Log roughly once per second (gameLoop default tick is 30 Hz).
     tickCounter++;
-    if (tickCounter % 30 != 0)
+
+    if (tickStopwatch.ElapsedMilliseconds < 1000)
     {
         return;
     }
 
-    if (snapshot.Count == 0)
-    {
-        logger.LogInformation("Simulation tick: no ships active.");
-        return;
-    }
+    var elapsedSeconds = tickStopwatch.Elapsed.TotalSeconds;
+    var tickRateHz = tickCounter / elapsedSeconds;
+    logger.LogInformation("Simulation tick rate: {TickRateHz:F2} Hz", tickRateHz);
 
-    foreach (var ship in snapshot)
-    {
-        logger.LogInformation(
-            "Ship {ShipId} pos=({PX:F2}, {PY:F2}, {PZ:F2}) vel=({VX:F2}, {VY:F2}, {VZ:F2})",
-            ship.Id,
-            ship.Position.X, ship.Position.Y, ship.Position.Z,
-            ship.Velocity.X, ship.Velocity.Y, ship.Velocity.Z);
-    }
+    tickCounter = 0;
+    tickStopwatch.Restart();
 };
 
 app.MapGet("/", () => Results.Ok("Gateway is running"));

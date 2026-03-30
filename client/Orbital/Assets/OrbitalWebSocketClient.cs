@@ -1,7 +1,5 @@
 using System;
-using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 using UnityEngine;
 
 // Connects to server websocket, sends movement input, and applies authoritative ship position.
@@ -13,85 +11,193 @@ public sealed class OrbitalWebSocketClient : MonoBehaviour
 
     [SerializeField] private string shipName = "Ship";
     [SerializeField] private Color shipColor = new Color(0.2f, 0.9f, 0.5f, 1f);
+    [Header("Render Smoothing")]
+    [Tooltip("Fallback server frame interval when not enough packets have arrived.")]
+    [SerializeField] private float defaultServerFrameInterval = 1f / 30f;
+    [Tooltip("How strongly we smooth measured packet interval (0=none, 1=very smooth).")]
+    [Range(0f, 0.99f)]
+    [SerializeField] private float serverIntervalSmoothing = 0.85f;
+    [Tooltip("How much each incoming server frame influences the visual target (lower = softer corrections).")]
+    [Range(0.05f, 1f)]
+    [SerializeField] private float serverFrameInfluence = 0.35f;
+    [Tooltip("Per-frame lerp strength relative to (deltaTime / estimatedServerFrameInterval).")]
+    [Range(0.05f, 1.5f)]
+    [SerializeField] private float perFrameFollowStrength = 0.45f;
+    [Tooltip("Hard cap on render correction speed in world units per second.")]
+    [SerializeField] private float maxRenderCorrectionSpeed = 35f;
+    [Header("Debug")]
+    [SerializeField] private bool showSimpleNetDebugOverlay = true;
+    [SerializeField] private Vector2 debugOverlayOffset = new Vector2(12f, 12f);
+    [SerializeField] private bool enableRuntimeTuningHotkeys = true;
 
-    private System.Net.WebSockets.ClientWebSocket _ws;
     private CancellationTokenSource _cts;
-
-    private readonly object _inputLock = new object();
-    private float _thrust01;
-    private float _yawRad;
-    private float _pitchRad;
+    private OrbitalWebSocketSession _session;
+    private OrbitalInput _input;
+    private OrbitalSnapshotParser _parser;
+    private readonly object _stateGate = new object();
+    private Vector3 _latestServerPosition;
+    private bool _hasServerPosition;
+    private Vector3 _latestReceivedPosition;
+    private int _receivedFrames;
+    private float _estimatedServerFrameInterval = 1f / 30f;
+    private long _lastReceiveTimestamp;
 
     private string _shipIdStr = string.Empty;
-    private Guid _shipId;
     private Transform _shipTransform;
-
-    // Received from background thread; applied on Unity main thread.
-    private readonly object _stateLock = new object();
-    private bool _hasState;
-    private ShipStateUnity _latestState;
-
-    private const int SendRateHz = 30;
 
     private async void Start()
     {
-        _shipId = Guid.NewGuid();
-        _shipIdStr = _shipId.ToString("D");
+        _shipIdStr = Guid.NewGuid().ToString("D");
+        _estimatedServerFrameInterval = Mathf.Max(0.001f, defaultServerFrameInterval);
 
-        SpawnShip();
+        _shipTransform = OrbitalShipSpawner.SpawnCubeShip(shipName, shipColor);
 
         _cts = new CancellationTokenSource();
+        _input = new OrbitalInput();
+        _parser = new OrbitalSnapshotParser(_shipIdStr);
 
         var url = ResolveWebSocketUrl();
-        Debug.Log($"[Orbital] Connecting to websocket: {url}");
+        UnityEngine.Debug.Log($"[Orbital] Connecting to websocket: {url}");
 
-        _ws = new System.Net.WebSockets.ClientWebSocket();
+        _session = new OrbitalWebSocketSession(_shipIdStr, sendRateHz: 30);
         try
         {
-            await _ws.ConnectAsync(new Uri(url), _cts.Token);
-            Debug.Log("[Orbital] WebSocket connected.");
+            await _session.ConnectAsync(url, _cts.Token);
+            UnityEngine.Debug.Log("[Orbital] WebSocket connected.");
         }
         catch (Exception e)
         {
-            Debug.LogError($"[Orbital] WebSocket connect failed: {e}");
+            UnityEngine.Debug.LogError($"[Orbital] WebSocket connect failed: {e}");
             return;
         }
 
-        // Kick off background send/receive loops.
-        _ = Task.Run(() => ReceiveLoop(_cts.Token));
-        _ = Task.Run(() => SendLoop(_cts.Token));
+        _session.RunBackgroundLoops(
+            _cts.Token,
+            buildInputJson: () => _session.BuildInputJson(_input.GetSnapshot()),
+            onTextMessage: OnServerMessage);
     }
 
     private void Update()
     {
-        ReadInput(Time.deltaTime);
+        _input?.TickFromUnity(Time.deltaTime);
+        HandleRuntimeTuningHotkeys();
 
-        // Apply any server updates (authoritative position).
-        ShipStateUnity stateToApply = null;
-        lock (_stateLock)
+        var hasServerPosition = false;
+        var latestServerPosition = Vector3.zero;
+        var estimatedFrameInterval = defaultServerFrameInterval;
+        lock (_stateGate)
         {
-            if (_hasState)
-            {
-                stateToApply = _latestState;
-                _hasState = false;
-            }
+            hasServerPosition = _hasServerPosition;
+            latestServerPosition = _latestServerPosition;
+            estimatedFrameInterval = _estimatedServerFrameInterval;
         }
 
-        if (stateToApply != null)
+        if (hasServerPosition)
         {
-            var state = stateToApply;
-            _shipTransform.position = new Vector3(state.position.x, state.position.y, state.position.z);
-
-            // Visual orientation follows current input, not server physics (server only sends pos/vel).
-            float yaw, pitch;
-            lock (_inputLock)
-            {
-                yaw = _yawRad;
-                pitch = _pitchRad;
-            }
-
-            _shipTransform.rotation = Quaternion.LookRotation(GetForwardFromYawPitch(yaw, pitch), Vector3.up);
+            var frameInterval = Mathf.Max(0.001f, estimatedFrameInterval);
+            var t = Mathf.Clamp01((Time.deltaTime / frameInterval) * perFrameFollowStrength);
+            var lerped = Vector3.Lerp(_shipTransform.position, latestServerPosition, t);
+            _shipTransform.position = Vector3.MoveTowards(
+                _shipTransform.position,
+                lerped,
+                Mathf.Max(0f, maxRenderCorrectionSpeed) * Time.deltaTime);
         }
+
+        // Visual orientation follows current input, not server physics (server only sends pos/vel).
+        var input = _input.GetSnapshot();
+        _shipTransform.rotation = Quaternion.LookRotation(
+            OrbitalMath.GetForwardFromYawPitch(input.yawRad, input.pitchRad),
+            Vector3.up);
+    }
+
+    private void OnServerMessage(string message)
+    {
+        var state = _parser?.TryExtractOurShipState(message);
+        if (state != null)
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            var receivedPosition = new Vector3(state.position.x, state.position.y, state.position.z);
+            lock (_stateGate)
+            {
+                if (_hasServerPosition)
+                    _latestServerPosition = Vector3.Lerp(_latestServerPosition, receivedPosition, serverFrameInfluence);
+                else
+                    _latestServerPosition = receivedPosition;
+
+                _hasServerPosition = true;
+                _latestReceivedPosition = receivedPosition;
+                _receivedFrames++;
+
+                if (_lastReceiveTimestamp != 0)
+                {
+                    var dt = (float)(now - _lastReceiveTimestamp) / System.Diagnostics.Stopwatch.Frequency;
+                    if (dt > 0f && dt < 1f)
+                    {
+                        var a = Mathf.Clamp01(serverIntervalSmoothing);
+                        _estimatedServerFrameInterval = (a * _estimatedServerFrameInterval) + ((1f - a) * dt);
+                    }
+                }
+                _lastReceiveTimestamp = now;
+            }
+        }
+    }
+
+    private void OnGUI()
+    {
+        if (!showSimpleNetDebugOverlay)
+            return;
+
+        var hasServerPosition = false;
+        var latestServerPosition = Vector3.zero;
+        var latestReceived = Vector3.zero;
+        var received = 0;
+        var estimatedInterval = defaultServerFrameInterval;
+
+        lock (_stateGate)
+        {
+            hasServerPosition = _hasServerPosition;
+            latestServerPosition = _latestServerPosition;
+            latestReceived = _latestReceivedPosition;
+            received = _receivedFrames;
+            estimatedInterval = _estimatedServerFrameInterval;
+        }
+
+        var rect = new Rect(debugOverlayOffset.x, debugOverlayOffset.y, 640f, 168f);
+        GUI.Box(rect, string.Empty);
+
+        var labelRect = new Rect(rect.x + 8f, rect.y + 8f, rect.width - 16f, rect.height - 16f);
+        var text =
+            "Orbital Net Debug (Per-Frame Lerp)\n" +
+            $"Received Frames: {received}\n" +
+            $"Have Server Pos: {(hasServerPosition ? "Yes" : "No")}\n" +
+            $"Estimated Server Interval: {estimatedInterval * 1000f:F1} ms\n" +
+            $"Frame Influence: {serverFrameInfluence:F2}  |  Follow Strength: {perFrameFollowStrength:F2}\n" +
+            $"Max Correction Speed: {maxRenderCorrectionSpeed:F1} u/s\n" +
+            $"Latest Received Pos: {latestReceived.x:F2}, {latestReceived.y:F2}, {latestReceived.z:F2}\n" +
+            $"Current Target Pos: {latestServerPosition.x:F2}, {latestServerPosition.y:F2}, {latestServerPosition.z:F2}\n" +
+            "Tune: [ / ] influence, ; / ' follow strength, , / . max correction speed";
+        GUI.Label(labelRect, text);
+    }
+
+    private void HandleRuntimeTuningHotkeys()
+    {
+        if (!enableRuntimeTuningHotkeys)
+            return;
+
+        if (Input.GetKeyDown(KeyCode.LeftBracket))
+            serverFrameInfluence = Mathf.Clamp(serverFrameInfluence - 0.05f, 0.05f, 1f);
+        if (Input.GetKeyDown(KeyCode.RightBracket))
+            serverFrameInfluence = Mathf.Clamp(serverFrameInfluence + 0.05f, 0.05f, 1f);
+
+        if (Input.GetKeyDown(KeyCode.Semicolon))
+            perFrameFollowStrength = Mathf.Clamp(perFrameFollowStrength - 0.05f, 0.05f, 1.5f);
+        if (Input.GetKeyDown(KeyCode.Quote))
+            perFrameFollowStrength = Mathf.Clamp(perFrameFollowStrength + 0.05f, 0.05f, 1.5f);
+
+        if (Input.GetKeyDown(KeyCode.Comma))
+            maxRenderCorrectionSpeed = Mathf.Clamp(maxRenderCorrectionSpeed - 2f, 1f, 200f);
+        if (Input.GetKeyDown(KeyCode.Period))
+            maxRenderCorrectionSpeed = Mathf.Clamp(maxRenderCorrectionSpeed + 2f, 1f, 200f);
     }
 
     private void OnApplicationQuit()
@@ -99,22 +205,10 @@ public sealed class OrbitalWebSocketClient : MonoBehaviour
         try { _cts.Cancel(); } catch { /* best effort */ }
     }
 
-    private void SpawnShip()
+    private void OnDestroy()
     {
-        var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        go.name = shipName;
-        go.transform.position = Vector3.zero;
-        go.transform.localScale = Vector3.one * 0.5f;
-
-        // Make it look nicer.
-        var renderer = go.GetComponent<Renderer>();
-        if (renderer != null)
-        {
-            renderer.material = new Material(Shader.Find("Standard"));
-            renderer.material.color = shipColor;
-        }
-
-        _shipTransform = go.transform;
+        try { _cts?.Cancel(); } catch { /* best effort */ }
+        try { _session?.Dispose(); } catch { /* best effort */ }
     }
 
     private string ResolveWebSocketUrl()
@@ -131,199 +225,5 @@ public sealed class OrbitalWebSocketClient : MonoBehaviour
         // => websocket is ws://localhost:5165/ws
         return "ws://localhost:5165/ws";
     }
-
-    private void ReadInput(float dt)
-    {
-        // Thrust: W/S.
-        float thrust = 0f;
-        if (Input.GetKey(KeyCode.W)) thrust += 1f;
-        if (Input.GetKey(KeyCode.S)) thrust -= 1f;
-        thrust = Mathf.Clamp(thrust, 0f, 1f);
-
-        // Yaw/Pitch: arrows.
-        float yawDelta = 0f;
-        if (Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow)) yawDelta += 1f;
-        if (Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow)) yawDelta -= 1f;
-
-        float pitchDelta = 0f;
-        if (Input.GetKey(KeyCode.UpArrow)) pitchDelta += 1f;
-        if (Input.GetKey(KeyCode.DownArrow)) pitchDelta -= 1f;
-
-        // Convert to radians. (Server expects yaw/pitch radians for cos/sin.)
-        const float yawSpeedRadPerSec = 1.5f;
-        const float pitchSpeedRadPerSec = 1.2f;
-
-        lock (_inputLock)
-        {
-            _thrust01 = thrust;
-            _yawRad += yawDelta * yawSpeedRadPerSec * dt;
-            _pitchRad += pitchDelta * pitchSpeedRadPerSec * dt;
-
-            // Prevent flipping and keep stable.
-            _pitchRad = Mathf.Clamp(_pitchRad, -1.4f, 1.4f);
-        }
-    }
-
-    private async Task SendLoop(CancellationToken token)
-    {
-        var delay = TimeSpan.FromSeconds(1d / SendRateHz);
-
-        while (!token.IsCancellationRequested && _ws != null && _ws.State == System.Net.WebSockets.WebSocketState.Open)
-        {
-            float thrust, yaw, pitch;
-            lock (_inputLock)
-            {
-                thrust = _thrust01;
-                yaw = _yawRad;
-                pitch = _pitchRad;
-            }
-
-            // Server supported format:
-            // { "shipId": "...", "input": { "thrust": 1, "yaw": 0, "pitch": 0 } }
-            // Keys are case-insensitive on server, but we keep them consistent.
-            // Use invariant formatting without locale-dependent commas.
-            var json = $"{{\"shipId\":\"{_shipIdStr}\",\"input\":{{\"thrust\":{thrust.ToString(System.Globalization.CultureInfo.InvariantCulture)}," +
-                       $"\"yaw\":{yaw.ToString(System.Globalization.CultureInfo.InvariantCulture)}," +
-                       $"\"pitch\":{pitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}}}";
-
-            try
-            {
-                var payload = Encoding.UTF8.GetBytes(json);
-                await _ws.SendAsync(payload, System.Net.WebSockets.WebSocketMessageType.Text, endOfMessage: true, token);
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[Orbital] WebSocket send failed: {e.Message}");
-                return;
-            }
-
-            try { await Task.Delay(delay, token); } catch { /* token canceled */ }
-        }
-    }
-
-    private async Task ReceiveLoop(CancellationToken token)
-    {
-        var buffer = new byte[8192];
-
-        try
-        {
-            while (!token.IsCancellationRequested && _ws.State == System.Net.WebSockets.WebSocketState.Open)
-            {
-                var messageBuilder = new StringBuilder();
-                System.Net.WebSockets.WebSocketReceiveResult receiveResult;
-
-                do
-                {
-                    receiveResult = await _ws.ReceiveAsync(buffer, token);
-                    if (receiveResult.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
-                        return;
-
-                    var chunk = Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
-                    messageBuilder.Append(chunk);
-                }
-                while (!receiveResult.EndOfMessage);
-
-                var message = messageBuilder.ToString();
-                var state = TryExtractOurShipState(message);
-                if (state != null)
-                {
-                    lock (_stateLock)
-                    {
-                        _latestState = state;
-                        _hasState = true;
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected on shutdown.
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[Orbital] WebSocket receive failed: {e.Message}");
-        }
-    }
-
-    // Server sends a snapshot array:
-    // [ { "id": "...", "position": { "x": ..., "y": ..., "z": ... }, "velocity": { ... } }, ... ]
-    private ShipStateUnity TryExtractOurShipState(string snapshotJsonArray)
-    {
-        if (string.IsNullOrWhiteSpace(snapshotJsonArray))
-            return null;
-
-        // JsonUtility is case-sensitive; normalize common casing variants from the server.
-        snapshotJsonArray = snapshotJsonArray
-            .Replace("\"Id\"", "\"id\"")
-            .Replace("\"Position\"", "\"position\"")
-            .Replace("\"Velocity\"", "\"velocity\"")
-            .Replace("\"X\"", "\"x\"")
-            .Replace("\"Y\"", "\"y\"")
-            .Replace("\"Z\"", "\"z\"");
-
-        // Unity's JsonUtility can only parse root objects, not arrays.
-        // Wrap: {"items": <array>}
-        var wrapped = $"{{\"items\":{snapshotJsonArray}}}";
-
-        SnapshotWrapperUnity wrapper = null;
-        try
-        {
-            wrapper = JsonUtility.FromJson<SnapshotWrapperUnity>(wrapped);
-        }
-        catch
-        {
-            // Ignore malformed payloads.
-        }
-
-        if (wrapper == null || wrapper.items == null)
-            return null;
-
-        for (int i = 0; i < wrapper.items.Length; i++)
-        {
-            var item = wrapper.items[i];
-            if (item == null) continue;
-
-            // Server may camelCase the Guid string keys. Compare exact d-format string.
-            if (string.Equals(item.id, _shipIdStr, StringComparison.OrdinalIgnoreCase))
-                return item;
-        }
-
-        return null;
-    }
-
-    private static Vector3 GetForwardFromYawPitch(float yawRad, float pitchRad)
-    {
-        // Must mirror server logic (server/Simulation/GameLoop.cs)
-        // forward = normalize(new Vector3(cp * cy, sp, cp * sy));
-        var cp = Mathf.Cos(pitchRad);
-        var sp = Mathf.Sin(pitchRad);
-        var cy = Mathf.Cos(yawRad);
-        var sy = Mathf.Sin(yawRad);
-        var f = new Vector3(cp * cy, sp, cp * sy);
-        return f.sqrMagnitude > 0.000001f ? f.normalized : Vector3.forward;
-    }
-
-    [Serializable]
-    private struct Vector3FieldsUnity
-    {
-        public float x;
-        public float y;
-        public float z;
-    }
-
-    [Serializable]
-    private sealed class ShipStateUnity
-    {
-        public string id;
-        public Vector3FieldsUnity position;
-        public Vector3FieldsUnity velocity;
-    }
-
-    [Serializable]
-    private sealed class SnapshotWrapperUnity
-    {
-        public ShipStateUnity[] items;
-    }
-
 }
 
