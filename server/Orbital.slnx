@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Gateway/Gateway.csproj" />
+  <Project Path="Services/Services.csproj" />
+  <Project Path="Shared/Shared.csproj" />
+  <Project Path="Simulation/Simulation.csproj" />
+</Solution>

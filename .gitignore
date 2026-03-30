@@ -1,0 +1,47 @@
+# --- .NET / Visual Studio ---
+**/bin/
+**/obj/
+
+# NuGet/VS user files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider/VSCode
+.idea/
+.vscode/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# --- Unity (thin renderer layer) ---
+# Keep:
+# - Assets/ (including .meta files)
+# - ProjectSettings/
+# - Packages/manifest.json and Packages/packages-lock.json
+#
+# Ignore generated Unity caches and editor/runtime artifacts.
+client/**/Library/
+client/**/Temp/
+client/**/Logs/
+client/**/UserSettings/
+client/**/Build/
+client/**/Builds/
+client/**/Obj/
+client/**/System/
+
+# Unity sometimes generates these at the project root.
+client/**/*.pid
+client/**/UnityLockfile
+
+# Package manager caches
+client/**/PackageCache/
+
+# If there are other files under Packages, ignore them by default,
+# but keep the manifest/lock for reproducible dependency resolution.
+client/**/Packages/*
+!client/**/Packages/manifest.json
+!client/**/Packages/packages-lock.json
+
